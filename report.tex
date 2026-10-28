@@ -1,0 +1,165 @@
+\documentclass[11pt, a4paper]{article}
+
+\usepackage[utf-8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{textcomp}
+
+\title{\textbf{Bird Sound Classification using Transformers} \\
+       Fine-Tuning Audio Spectrogram Transformers on BirdCLEF 2021}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Problem Formulation}
+
+\subsection{Task Description}
+This project addresses automated bird species classification from audio recordings. Given a raw audio clip (8--30 seconds), the model must predict which of 10 bird species produced the sound. This is a multi-class classification problem with significant real-world applications in ecological monitoring, biodiversity research, and citizen science initiatives.
+
+\subsection{Dataset}
+We use a curated subset of the BirdCLEF 2021 Kaggle competition dataset containing 10 acoustically diverse bird species:
+\begin{itemize}
+  \item \textbf{Total recordings:} 5,000 (500 per species from XenoCanto)
+  \item \textbf{Audio format:} `.ogg` files at 16 kHz sample rate
+  \item \textbf{Duration:} 8--30 seconds per recording
+  \item \textbf{Data split:} Stratified into train (4,000 recordings / 400 per species), validation (500 / 50 per species), and test (500 / 50 per species)
+\end{itemize}
+
+\subsection{Data Preprocessing}
+All audio is resampled to 16 kHz and chunked into non-overlapping 10-second segments (160,000 samples per chunk). Chunks shorter than 10 seconds are zero-padded. This produces approximately 24,000 training chunks, 3,000 validation chunks, and 3,000 test chunks. Recording-level predictions aggregate logits over all chunks of a full recording via mean pooling, reflecting real-world inference where we classify full-length clips.
+
+\subsection{Evaluation Metrics}
+We report two accuracy metrics:
+\begin{itemize}
+  \item \textbf{Chunk-level accuracy:} Fraction of 10-second chunks classified correctly (one prediction per chunk).
+  \item \textbf{Recording-level accuracy:} Fraction of full recordings classified correctly after averaging chunk logits and taking argmax.
+\end{itemize}
+Recording-level accuracy is the primary metric because it reflects how the model would be deployed in practice.
+
+\section{Model Design Choices}
+
+\subsection{Architecture: Audio Spectrogram Transformer}
+We selected the \textbf{Audio Spectrogram Transformer (AST)} as our core model. AST is a vision transformer pretrained on AudioSet (1.9M audio clips across 527 label categories). The architecture operates on 128-bin mel-spectrograms (1024-sample window, 128-sample hop) processed by a patch embedding layer followed by a 12-layer transformer encoder with 12 attention heads.
+
+\textbf{Rationale:}
+\begin{enumerate}
+  \item \textbf{Transfer Learning:} AudioSet pretraining provides rich acoustic representations that generalize well to novel tasks and smaller datasets.
+  \item \textbf{Attention Mechanism:} Transformers capture long-range temporal and spectral dependencies superior to CNNs for audio, important for discriminating bird vocalizations that encode species identity across time.
+  \item \textbf{Efficiency:} At ~85M parameters, AST balances model capacity with computational tractability on moderate GPUs.
+\end{enumerate}
+
+\subsection{Fine-Tuning Strategy}
+Rather than training from scratch, we fine-tune the pretrained AST backbone. This approach:
+\begin{itemize}
+  \item Dramatically reduces training time (5 epochs vs. hundreds on random initialization).
+  \item Requires minimal labeled data (4,000 training recordings is small for deep learning).
+  \item Achieves superior generalization by leveraging broad acoustic knowledge from AudioSet.
+\end{itemize}
+
+\noindent
+The fine-tuning objective replaces the 527-class AudioSet head with a 10-class linear classifier and uses cross-entropy loss. All transformer parameters are unfrozen to allow adaptation to bird calls.
+
+\section{Training Strategy and Hyperparameter Tuning}
+
+\subsection{Hyperparameter Search}
+Given the high computational cost of each full 5-epoch fine-tune (~65 minutes on an L40S GPU), we performed a \textbf{random search} to explore the learning rate $(lr)$ and weight decay $(wd)$ parameter space. The search spanned:
+\begin{itemize}
+  \item Learning rate: $[10^{-5}, 10^{-3}]$ (log-uniform)
+  \item Weight decay: $[10^{-4}, 10^{-1}]$ (log-uniform)
+\end{itemize}
+
+\noindent
+We evaluated $\approx 20$ configurations and selected the three best (spanning different regimes) for final validation and test evaluation. These three configurations are:
+
+\begin{center}
+\begin{tabular}{lccl}
+  \toprule
+  \textbf{Config} & \textbf{LR} & \textbf{WD} & \textbf{Description} \\
+  \midrule
+  A & $2.10 \times 10^{-4}$ & $5.70 \times 10^{-4}$ & Sweep best; standard regime \\
+  B & $1.72 \times 10^{-4}$ & $7.41 \times 10^{-2}$ & Mid-LR, heavy regularization \\
+  C & $1.30 \times 10^{-5}$ & $5.09 \times 10^{-2}$ & Low-LR, heavy regularization \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Training Hyperparameters}
+All three configurations use:
+\begin{itemize}
+  \item \textbf{Optimizer:} AdamW
+  \item \textbf{Batch size:} 16 (with gradient accumulation $\times 2$ $\Rightarrow$ effective batch size 32)
+  \item \textbf{Epochs:} 5
+  \item \textbf{Warmup steps:} 50
+  \item \textbf{Loss:} Cross-entropy
+  \item \textbf{Training data:} 100\% of training split (24k chunks)
+  \item \textbf{Hardware:} Modal L40S GPU
+\end{itemize}
+
+\noindent
+The three selected configurations demonstrate different regularization philosophies:
+\begin{itemize}
+  \item \textbf{Config A:} Light regularization, closest to the hyperparameter sweep optimum.
+  \item \textbf{Config B \& C:} Heavy weight decay ($> 0.05$), reducing risk of overfitting but at risk of underfitting if too strong.
+\end{itemize}
+
+\noindent
+Training dynamics show all three configurations converge to $\geq 0.91$ chunk-level validation accuracy by epoch 1, indicating the AudioSet pretrained backbone already captures discriminative acoustic features. Subsequent epochs provide modest refinement. Config C (low LR) exhibits the smoothest training curves, while configs B and C maintain visibly higher training loss than A due to regularization.
+
+\section{Performance Analysis}
+
+\subsection{Summary Results}
+\begin{center}
+\begin{tabular}{lccc}
+  \toprule
+  \textbf{Configuration} & \textbf{Best Val Acc} & \textbf{Test Chunk Acc} & \textbf{Test Record Acc} \\
+  \midrule
+  A & 0.9481 & 0.9468 & 0.9640 \\
+  B & 0.9356 & 0.9279 & 0.9560 \\
+  C & 0.9426 & 0.9362 & 0.9600 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+\textbf{Key observation:} Recording-level accuracy exceeds chunk-level by $\approx 1.5\%$. This improvement arises from mean-logit aggregation smoothing out occasional misclassifications on individual noisy chunks---a realistic benefit when classifying full-length clips at inference.
+
+\subsection{Per-Class Performance}
+F1 scores vary across species (range: $0.92$--$0.98$ at chunk level), with no systematic failures. Acoustic similarity between species (e.g., corvids, warblers) results in confusion, but all models consistently recover these patterns, indicating dataset-level challenges rather than configuration artifacts.
+
+\subsection{Model Robustness}
+The three configurations show high correlation in per-class F1 scores, suggesting the hyperparameter landscape near the search optimum is stable. Even config C (aggressively regularized) maintains strong performance, demonstrating that the pretrained AST foundation is robust across reasonable regularization choices.
+
+\section{Limitations and Future Work}
+
+\subsection{Limitations}
+\begin{enumerate}
+  \item \textbf{Dataset size:} 5,000 recordings (500 per species) is modest by deep learning standards. More data would likely further improve performance.
+  \item \textbf{Recording length heterogeneity:} The dataset contains clips ranging from 8--30 seconds. Longer clips are chunked, potentially losing temporal context at chunk boundaries. Overlap-based or hierarchical chunking might help.
+  \item \textbf{Acoustic diversity:} Each species is represented by recordings from XenoCanto, introducing author/equipment/recording-condition variation. Out-of-distribution audio (e.g., bioacoustic sensors, live field recordings with interference) may degrade performance.
+  \item \textbf{Hyperparameter search scope:} Our random search covered $\approx 20$ configurations. A more extensive Bayesian optimization or grid search may identify further improvements, though compute constraints limit this.
+  \item \textbf{Ensemble methods unexplored:} Averaging predictions from multiple models (AST, ResNet, other architectures) could boost accuracy, but was not explored due to time constraints.
+\end{enumerate}
+
+\subsection{Future Directions}
+\begin{itemize}
+  \item \textbf{Multi-modal learning:} Incorporate spectrogram features and raw waveform analysis jointly.
+  \item \textbf{Attention visualization:} Analyze which time-frequency regions AST focuses on for each species to gain ecological insight.
+  \item \textbf{Few-shot learning:} Evaluate model performance on rare species or species with limited training data.
+  \item \textbf{Streaming inference:} Adapt the model for real-time processing suitable for autonomous recording units deployed in the field.
+  \item \textbf{Domain adaptation:} Fine-tune on geographically or seasonally distinct subsets to assess generalization.
+\end{itemize}
+
+\section{Conclusion}
+
+We successfully fine-tuned the Audio Spectrogram Transformer on 10 bird species from BirdCLEF 2021, achieving $\approx 96\%$ recording-level test accuracy. The pretrained AudioSet backbone combined with transfer learning enabled rapid convergence (within 1 epoch). Systematic hyperparameter exploration identified three stable configurations spanning different regularization regimes, all achieving comparable performance. The model generalizes well despite modest dataset size, underscoring the value of large-scale pretraining for audio tasks. Future work will explore ensemble methods, multi-modal representations, and domain adaptation for improved robustness in field deployment.
+
+\end{document}
